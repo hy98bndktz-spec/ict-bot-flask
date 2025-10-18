@@ -11,8 +11,8 @@ from datetime import datetime, timezone
 # -----------------------
 # CONFIG - ضع القيم في Environment Variables (لا تضعها نصاً هنا)
 # BOT_TOKEN و CHAT_ID في متغيرات بيئة على Render / Replit
-TOKEN = os.environ.get("BOT_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")
+TOKEN = "8461165121:AAG3rQ5GFkv-Jmw-6GxHaQ56p-tgXLopp_A"
+CHAT_ID = "690864747"
 # symbols to monitor
 BINANCE_SYMBOL = "BTCUSDT"  # Bitcoin
 YFINANCE_SYMBOL = "GC=F"    # Gold futures (Yahoo)
