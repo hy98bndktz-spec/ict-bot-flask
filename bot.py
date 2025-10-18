@@ -2,31 +2,27 @@ import logging
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# إعداد تسجيل الأحداث (Logs)
+# إعداد التسجيل
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 
-# ضع توكن البوت هنا 👇
-TOKEN = "YOUR_BOT_TOKEN"
+# توكن البوت
+TOKEN = "8461165121:AAG3rQ5GFkv-Jmw-6GxHaQ56p-tgXLopp_A"
 
-# دالة بدء التشغيل /start
+# أمر /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ Bot is running successfully!")
+    await update.message.reply_text("🤖 البوت يعمل بنجاح على Render!")
 
-# دالة اختبار /ping
+# أمر /ping
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🏓 Pong! The bot is alive.")
+    await update.message.reply_text("🏓 Pong! البوت شغال ✅")
 
-# الدالة الرئيسية
 def main():
     app = ApplicationBuilder().token(TOKEN).build()
-
-    # ربط الأوامر
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ping", ping))
-
     print("🤖 Bot is running and polling for updates...")
     app.run_polling()
 
