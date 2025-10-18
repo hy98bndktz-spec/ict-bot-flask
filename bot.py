@@ -1,93 +1,191 @@
-import logging
+# bot.py
+import os
 import time
+import io
+import json
+import threading
+from datetime import datetime, timezone
 import requests
 import pandas as pd
 import matplotlib.pyplot as plt
-import io
-import yfinance as yf
-from telegram import Bot
-from telegram.ext import Updater, CommandHandler, JobQueue
+from flask import Flask, Response
 
-# إعداد التوكن ومعرّف الشات
-TELEGRAM_TOKEN = "ضع_هنا_التوكن"
-CHAT_ID = "ضع_هنا_ID_الشات"
+# ---------- إعدادات من متغيرات بيئة (ضعها في Render Environment) ----------
+BOT_TOKEN = os.environ.get("BOT_TOKEN")   # ضع هنا token في settings > Environment
+CHAT_ID = os.environ.get("CHAT_ID")       # وضع chat_id هنا أيضاً
 
-# إعداد التسجيل (logs)
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-                    level=logging.INFO)
-logger = logging.getLogger(__name__)
+if not BOT_TOKEN or not CHAT_ID:
+    raise RuntimeError("Missing BOT_TOKEN or CHAT_ID environment variables.")
 
-# دالة لجلب بيانات السوق وتحليلها
-def get_market_analysis():
-    ticker = "BTC-USD"
-    data = yf.download(ticker, period="1d", interval="5m")
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
+INTERVAL = "5m"
+LIMIT = 200
+FRESH_MINUTES = 15
 
-    if data.empty:
-        return None, "❌ لم يتم جلب البيانات."
+# ---------- دوال مساعدة ----------
 
-    data["RSI"] = compute_rsi(data["Close"])
-    current_price = data["Close"].iloc[-1]
-    rsi_value = data["RSI"].iloc[-1]
+def send_message(text):
+    url = TELEGRAM_API + "/sendMessage"
+    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
+    try:
+        r = requests.post(url, json=payload, timeout=15)
+        r.raise_for_status()
+    except Exception as e:
+        print("tg send_message error:", e)
 
-    if rsi_value < 30:
-        signal = "🟢 إشارة شراء (RSI منخفض)"
-    elif rsi_value > 70:
-        signal = "🔴 إشارة بيع (RSI مرتفع)"
-    else:
-        signal = "⚪ لا توجد إشارة واضحة"
+def send_photo_bytes(buf, caption=None):
+    url = TELEGRAM_API + "/sendPhoto"
+    files = {"photo": ("chart.png", buf, "image/png")}
+    data = {"chat_id": CHAT_ID}
+    if caption:
+        data["caption"] = caption
+        data["parse_mode"] = "Markdown"
+    try:
+        r = requests.post(url, files=files, data=data, timeout=60)
+        r.raise_for_status()
+    except Exception as e:
+        print("tg send_photo error:", e, getattr(e, "response", None))
 
-    # رسم بياني
-    fig, ax = plt.subplots()
-    ax.plot(data.index, data["Close"], label="السعر")
-    ax.set_title(f"{ticker} السعر الحالي: {current_price:.2f} - RSI: {rsi_value:.2f}")
-    ax.legend()
+def fetch_klines(symbol="BTCUSDT", interval=INTERVAL, limit=LIMIT):
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    try:
+        r = requests.get(BINANCE_KLINES, params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        df = pd.DataFrame(data, columns=[
+            "open_time","open","high","low","close","volume","close_time",
+            "quote_av","trades","tb_base_av","tb_quote_av","ignore"
+        ])
+        df["datetime"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+        df.set_index("datetime", inplace=True)
+        for c in ["open","high","low","close","volume"]:
+            df[c] = df[c].astype(float)
+        return df[["open","high","low","close","volume"]]
+    except Exception as e:
+        print("fetch_klines error:", e)
+        return None
 
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png')
-    buf.seek(0)
-    plt.close(fig)
-
-    text = f"📊 *تحليل السوق*\n\nالسعر الحالي: ${current_price:.2f}\nRSI: {rsi_value:.2f}\n\nالإشارة: {signal}"
-
-    return buf, text
-
-
-# دالة لحساب RSI
 def compute_rsi(series, period=14):
     delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    ma_up = up.ewm(com=period-1, adjust=False).mean()
+    ma_down = down.ewm(com=period-1, adjust=False).mean()
+    rs = ma_up / ma_down
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
 
+def make_chart_buffer(df, title="Chart"):
+    plt.switch_backend("Agg")
+    fig, ax = plt.subplots(figsize=(8,4))
+    ax.plot(df.index, df["close"], label="close")
+    ax.set_title(title)
+    ax.grid(True, alpha=0.2)
+    ax.legend()
+    buf = io.BytesIO()
+    fig.tight_layout()
+    fig.savefig(buf, format="png", dpi=120)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
 
-# دالة لإرسال التحليل إلى التلغرام
-def send_market_update(context):
-    bot = context.bot
-    buf, text = get_market_analysis()
-    if buf is None:
-        bot.send_message(chat_id=CHAT_ID, text=text)
-    else:
-        bot.send_photo(chat_id=CHAT_ID, photo=buf, caption=text, parse_mode="Markdown")
+def is_fresh(df):
+    if df is None or df.empty: return False
+    last_time = df.index[-1]
+    now = datetime.now(timezone.utc)
+    return (now - last_time).total_seconds() <= FRESH_MINUTES * 60
 
+# ---------- عملية التحليل وارسال النتائج ----------
+SYMBOLS = {
+    "XAU": "XAUUSDT",
+    "BTC": "BTCUSDT",
+    "ETH": "ETHUSDT",
+    "EURUSD": "EURUSDT",
+    "GBPUSD": "GBPUSDT",
+    "USDJPY": "USDJPY"
+}
 
-# دالة البدء
-def start(update, context):
-    update.message.reply_text("🤖 البوت يعمل الآن ويرسل التحديثات كل 5 دقائق!")
+def analyze_and_send():
+    for short, symbol in SYMBOLS.items():
+        try:
+            df = fetch_klines(symbol)
+            if df is None or len(df) < 30:
+                send_message(f"⚠️ Error analyzing {short}: no data for {symbol}.")
+                continue
+            if not is_fresh(df):
+                send_message(f"⚠️ Stale data for {symbol}.")
+                continue
 
+            df["RSI"] = compute_rsi(df["close"])
+            last = df.iloc[-1]
+            rsi_val = last["RSI"]
+            price = last["close"]
 
-def main():
-    updater = Updater(token=TELEGRAM_TOKEN, use_context=True)
-    dp = updater.dispatcher
+            if pd.isna(rsi_val):
+                send_message(f"⚠️ Error analyzing {short}: RSI NaN.")
+                continue
 
-    dp.add_handler(CommandHandler("start", start))
+            if rsi_val < 30:
+                sig = "BUY 🟢"
+            elif rsi_val > 70:
+                sig = "SELL 🔴"
+            else:
+                sig = "HOLD ⚪"
 
-    job_queue = updater.job_queue
-    job_queue.run_repeating(send_market_update, interval=300, first=10)
+            caption = (
+                f"*{short} / {symbol}*  \n"
+                f"Time (UTC): `{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}`  \n"
+                f"Price: `{price:.4f}`  \n"
+                f"RSI: `{rsi_val:.2f}`  \n"
+                f"Signal: *{sig}*"
+            )
 
-    updater.start_polling()
-    updater.idle()
+            # chart
+            try:
+                buf = make_chart_buffer(df, title=f"{symbol} close")
+                send_photo_bytes(buf, caption=caption)
+            except Exception as e:
+                print("chart/send error:", e)
+                send_message(caption)
 
+        except Exception as e:
+            print("analyze error:", e)
+            send_message(f"⚠️ Error analyzing {symbol}: {e}")
 
+# ---------- background scheduler using thread ----------
+def scheduler_loop(stop_event):
+    # run immediately on start, then every 5 minutes
+    while not stop_event.is_set():
+        try:
+            analyze_and_send()
+        except Exception as e:
+            print("scheduler_loop error:", e)
+        # sleep 5 minutes (poll for stop_event every second)
+        for _ in range(300):
+            if stop_event.is_set():
+                break
+            time.sleep(1)
+
+# ---------- Flask app (so Render sees a web process) ----------
+app = Flask(__name__)
+stop_event = threading.Event()
+worker_thread = None
+
+@app.route("/")
+def index():
+    return Response("OK - bot running", mimetype="text/plain")
+
+def start_background():
+    global worker_thread
+    if worker_thread and worker_thread.is_alive():
+        return
+    worker_thread = threading.Thread(target=scheduler_loop, args=(stop_event,), daemon=True)
+    worker_thread.start()
+
+# ---------- main ----------
 if __name__ == "__main__":
-    main()
+    # start background worker then run flask
+    start_background()
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
