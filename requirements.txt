@@ -2,5 +2,8 @@ python-telegram-bot==20.3
 requests
 pandas
 numpy
+matplotlib
 pandas_ta
 yfinance
+flask
+asyncio
