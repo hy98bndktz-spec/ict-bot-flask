@@ -3,4 +3,4 @@ requests
 pandas
 pandas_ta
 yfinance
-python-telegram-bot
+matplotlib
