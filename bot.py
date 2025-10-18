@@ -1,71 +1,140 @@
-import logging
-import yfinance as yf
-import pandas as pd
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-import asyncio
+# bot.py
 import os
+import time
+import io
+import requests
+import pandas as pd
+import pandas_ta as ta
+import yfinance as yf
+import matplotlib.pyplot as plt
+from datetime import datetime, timezone
+from flask import Flask
+import threading
 
-# إعداد السجلّات
-logging.basicConfig(level=logging.INFO)
+# -----------------------
+# إعدادات البوت (جاهزة)
+TOKEN = "8461165121:AAG3rQ5GFkv-Jmw-6GxHaQ56p-tgXLopp_A"
+CHAT_ID = "690864747"
 
-# ===== إعدادات البوت =====
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8461165121:AAG3rQ5GFkv-Jmw-6GxHaQ56p-tgXLopp_A")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "690864747"))
+# -----------------------
+# إعداد Flask لإبقاء السيرفر نشط
+app = Flask(__name__)
 
-# ===== جلب البيانات =====
-def get_data(symbol: str, timeframe="1h", limit=200):
-    try:
-        df = yf.download(symbol, period="7d", interval=timeframe)
-        if df.empty:
-            return pd.DataFrame()
-        df.dropna(inplace=True)
-        return df
-    except Exception as e:
-        logging.error(f"Error fetching {symbol}: {e}")
-        return pd.DataFrame()
+@app.route('/')
+def home():
+    return "🚀 ICT Smart Money Bot is running (5m timeframe)"
 
-# ===== تحليل الإشارات =====
-def generate_signal(df: pd.DataFrame):
-    try:
-        df["MA50"] = df["Close"].rolling(window=50).mean()
-        df["MA200"] = df["Close"].rolling(window=200).mean()
+# -----------------------
+# وظائف المساعدة
+def send_telegram_message(text):
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    requests.post(url, json={"chat_id": CHAT_ID, "text": text})
 
-        if df["MA50"].iloc[-1] > df["MA200"].iloc[-1]:
-            return "🟢 Buy Signal (Golden Cross)"
-        elif df["MA50"].iloc[-1] < df["MA200"].iloc[-1]:
-            return "🔴 Sell Signal (Death Cross)"
-        else:
-            return "⚪ Neutral (No clear signal)"
-    except Exception as e:
-        return f"⚠️ Error analyzing: {e}"
+def send_telegram_photo(image_bytes, caption=""):
+    url = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
+    files = {"photo": ("chart.png", image_bytes)}
+    data = {"chat_id": CHAT_ID, "caption": caption}
+    requests.post(url, data=data, files=files)
 
-# ===== أوامر البوت =====
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🚀 ICT Smart Money Bot started (1H/5M Strategy)\nUse /analyze to check signals.")
+def now_str():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔍 Analyzing markets, please wait...")
+# -----------------------
+# المؤشرات الفنية (ICT Style)
+def compute_indicators(df):
+    df["EMA20"] = ta.ema(df["close"], length=20)
+    df["EMA50"] = ta.ema(df["close"], length=50)
+    df["RSI"] = ta.rsi(df["close"], length=14)
+    df["OB"] = df["high"].rolling(20).max()  # منطقة عرض تقريبية
+    df["OS"] = df["low"].rolling(20).min()   # منطقة طلب تقريبية
+    return df
 
-    symbols = ["XAUUSD=X", "BTC-USD", "EURUSD=X"]
-    timeframes = {"1h": "1 Hour", "5m": "5 Minutes"}
+# -----------------------
+# تحديد الإشارة
+def generate_signal(df, symbol):
+    df = compute_indicators(df)
+    last = df.iloc[-1]
+    price = last["close"]
+    ema20, ema50, rsi = last["EMA20"], last["EMA50"], last["RSI"]
 
-    for symbol in symbols:
-        for tf, label in timeframes.items():
-            df = get_data(symbol, timeframe=tf)
+    signal = "HOLD"
+    tp = None
+
+    # اتجاه صاعد
+    if ema20 > ema50 and rsi < 70:
+        signal = "BUY"
+        tp = price * 1.002  # هدف بسيط
+    # اتجاه هابط
+    elif ema20 < ema50 and rsi > 30:
+        signal = "SELL"
+        tp = price * 0.998
+
+    return {
+        "symbol": symbol,
+        "price": price,
+        "signal": signal,
+        "tp": tp,
+        "rsi": rsi,
+        "time": now_str()
+    }
+
+# -----------------------
+# رسم الشارت
+def generate_chart(df, signal):
+    plt.figure(figsize=(8,4))
+    plt.plot(df.index, df["close"], label="Price", linewidth=1.5)
+    plt.plot(df.index, df["EMA20"], label="EMA20")
+    plt.plot(df.index, df["EMA50"], label="EMA50")
+    plt.title(f"{signal['symbol']} | {signal['signal']} | {signal['time']}")
+    plt.legend()
+    plt.grid(True)
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', bbox_inches="tight")
+    plt.close()
+    buf.seek(0)
+    return buf
+
+# -----------------------
+# تحليل الأصول
+def analyze_and_send():
+    assets = ["BTC-USD", "GC=F"]
+    for symbol in assets:
+        try:
+            df = yf.download(symbol, period="2d", interval="5m", progress=False)
             if df.empty:
-                await update.message.reply_text(f"⚠️ No data for {symbol} ({label})")
                 continue
 
-            result = generate_signal(df)
-            await update.message.reply_text(f"{symbol} ({label}): {result}")
+            df.rename(columns={"Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"}, inplace=True)
+            sig = generate_signal(df, symbol)
 
-# ===== دالة التشغيل =====
-def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("analyze", analyze))
-    app.run_polling()
+            if sig["signal"] != "HOLD":
+                caption = (
+                    f"📊 *ICT Smart Money Signal*\n"
+                    f"Asset: {sig['symbol']}\n"
+                    f"Time: {sig['time']}\n"
+                    f"Price: ${sig['price']:.2f}\n"
+                    f"Signal: {sig['signal']} 📈\n"
+                    f"RSI: {sig['rsi']:.1f}\n"
+                    f"🎯 Take Profit: {sig['tp']:.2f}\n"
+                    f"⚙️ Strategy: Michael ICT - Smart Money Concepts"
+                )
+                chart = generate_chart(df, sig)
+                send_telegram_photo(chart, caption)
+            else:
+                print(f"{now_str()} - {symbol}: HOLD")
 
+        except Exception as e:
+            send_telegram_message(f"⚠️ Error analyzing {symbol}: {e}")
+
+# -----------------------
 if __name__ == "__main__":
-    main()
+    send_telegram_message("🚀 ICT Smart Money Bot started successfully (5m timeframe)")
+
+    def loop_run():
+        while True:
+            analyze_and_send()
+            time.sleep(300)  # كل 5 دقائق
+
+    threading.Thread(target=loop_run, daemon=True).start()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
