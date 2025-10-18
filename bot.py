@@ -2,6 +2,7 @@
 import os
 import time
 import io
+import json
 import math
 import requests
 import pandas as pd
@@ -9,87 +10,116 @@ import numpy as np
 import mplfinance as mpf
 import matplotlib.pyplot as plt
 from datetime import datetime, timezone, timedelta
-from flask import Flask
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    JobQueue,
+)
 import threading
 
 # -----------------------
-# CONFIG (already filled with your values)
+# CONFIG - مدرج التوكن الذي أعطيتني
 TOKEN = "8461165121:AAG3rQ5GFkv-Jmw-6GxHaQ56p-tgXLopp_A"
-CHAT_ID = "690864747"
-TWELVE_API_KEY = "0176951f5a044e719d7e644a6885120a"
+# ملف حفظ المشتركين
+SUBS_FILE = "subscribers.json"
 
-# ASSETS — TwelveData symbols
-ASSETS = [
-    "XAU/USD",  # Gold
-    "BTC/USD",  # Bitcoin
-    "ETH/USD",  # Ethereum
-    "EUR/USD",
-    "USD/JPY",
-    "GBP/USD"
-]
+# Binance symbols (5m)
+SYMBOLS = {
+    "XAU": "XAUUSDT",   # Gold synthetic on Binance (if available)
+    "BTC": "BTCUSDT",
+    "ETH": "ETHUSDT",
+    "EURUSD": "EURUSDT",  # note: Binance symbol uses base/USDT; EURUSDT exists
+    "USDJPY": "USDJPY",   # may not exist on Binance; we'll try fallback to "EURUSD" if missing
+    "GBPUSD": "GBPUSDT"
+}
 
-INTERVAL = "5min"
-OUTPUTSIZE = 200  # number of candles to fetch
-FRESHNESS_MINUTES = 20  # consider data stale if last candle older than this
+INTERVAL = "5m"
+LIMIT = 200
 
-# Flask app for Render
-app = Flask(__name__)
-
-@app.route("/")
-def home():
-    return "🚀 ICT-style Bot (dark candles) - running"
+# how fresh data must be (minutes)
+FRESHNESS_MINUTES = 15
 
 # -----------------------
-# Helper: send message / photo to Telegram
-def tg_send_message(text):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+# helpers: subscribers persistence
+def load_subs():
+    if os.path.exists(SUBS_FILE):
+        try:
+            with open(SUBS_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return []
+
+def save_subs(subs):
+    with open(SUBS_FILE, "w") as f:
+        json.dump(list(set(subs)), f)
+
+# -----------------------
+# Telegram helpers
+async def add_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    subs = load_subs()
+    if chat_id in subs:
+        await context.bot.send_message(chat_id=chat_id, text="✅ You are already subscribed. You will receive signals.")
+        return
+    subs.append(chat_id)
+    save_subs(subs)
+    await context.bot.send_message(chat_id=chat_id, text="✅ Subscribed! You will receive signals every 5 minutes. Use /stop to unsubscribe.")
+
+async def remove_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    subs = load_subs()
+    if chat_id in subs:
+        subs.remove(chat_id)
+        save_subs(subs)
+        await context.bot.send_message(chat_id=chat_id, text="🛑 Unsubscribed. You will no longer receive signals.")
+    else:
+        await context.bot.send_message(chat_id=chat_id, text="You are not subscribed.")
+
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    subs = load_subs()
+    await context.bot.send_message(chat_id=update.effective_chat.id, text=f"Subscribers: {len(subs)}")
+
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await add_sub(update, context)
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "/start - subscribe to signals\n"
+        "/stop - unsubscribe\n"
+        "/status - show subscriber count (admin)\n"
+        "/analyze - run immediate analysis now"
+    )
+    await context.bot.send_message(chat_id=update.effective_chat.id, text=text)
+
+# -----------------------
+# Binance klines fetcher
+def get_klines_binance(symbol, interval=INTERVAL, limit=LIMIT):
     try:
-        requests.post(url, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=15)
+        url = "https://api.binance.com/api/v3/klines"
+        params = {"symbol": symbol, "interval": interval, "limit": limit}
+        r = requests.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        # columns: openTime, open, high, low, close, volume, closeTime, ...
+        df = pd.DataFrame(data, columns=[
+            "open_time","open","high","low","close","volume",
+            "close_time","quote_asset_volume","num_trades","taker_buy_base","taker_buy_quote","ignore"
+        ])
+        df["datetime"] = pd.to_datetime(df["open_time"], unit="ms")
+        df.set_index("datetime", inplace=True)
+        for c in ["open","high","low","close","volume"]:
+            df[c] = df[c].astype(float)
+        return df[["open","high","low","close","volume"]]
     except Exception as e:
-        print("tg send msg failed:", e)
-
-def tg_send_photo(img_bytes, caption=""):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
-    files = {"photo": ("chart.png", img_bytes)}
-    data = {"chat_id": CHAT_ID, "caption": caption, "parse_mode": "Markdown"}
-    try:
-        requests.post(url, data=data, files=files, timeout=30)
-    except Exception as e:
-        print("tg send photo failed:", e)
-
-def now_utc_str():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        # return None on error
+        print("Binance fetch error for", symbol, e)
+        return None
 
 # -----------------------
-# Get OHLC data from TwelveData
-def get_data_td(symbol, interval=INTERVAL, outputsize=OUTPUTSIZE):
-    base = "https://api.twelvedata.com/time_series"
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "outputsize": outputsize,
-        "format": "JSON",
-        "apikey": TWELVE_API_KEY
-    }
-    r = requests.get(base, params=params, timeout=20)
-    data = r.json()
-    if "values" not in data:
-        raise RuntimeError(f"TwelveData error for {symbol}: {data}")
-    df = pd.DataFrame(data["values"])
-    # TwelveData returns newest first -> reverse
-    df = df.iloc[::-1].reset_index(drop=True)
-    df["datetime"] = pd.to_datetime(df["datetime"])
-    df.set_index("datetime", inplace=True)
-    # ensure numeric columns
-    for c in ["open","high","low","close","volume"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors='coerce')
-    # keep ohlc
-    df = df.loc[:, df.columns.intersection(["open","high","low","close","volume"])]
-    return df
-
-# -----------------------
-# Indicators (EMA, RSI)
+# Indicators and ICT-ish detection (approx)
 def ema(series, span):
     return series.ewm(span=span, adjust=False).mean()
 
@@ -110,134 +140,100 @@ def compute_indicators(df):
     df["RSI"] = compute_rsi(df["close"], 14)
     return df
 
-# -----------------------
-# ICT-like heuristics (approximate)
 def detect_fvg(df):
-    # Fair Value Gap: check recent 3-candle patterns where middle body doesn't overlap neighbors
-    fvg_list = []
+    fvg = []
+    # simple heuristic: middle candle body not overlapping neighbors
     for i in range(1, len(df)-1):
-        a_close, a_open = df["close"].iloc[i-1], df["open"].iloc[i-1]
-        b_close, b_open = df["close"].iloc[i], df["open"].iloc[i]
-        c_close, c_open = df["close"].iloc[i+1], df["open"].iloc[i+1]
-        # bullish FVG example: middle bearish, and gap between a.close and c.open
-        try:
-            body_a_low, body_a_high = min(a_open, a_close), max(a_open, a_close)
-            body_b_low, body_b_high = min(b_open, b_close), max(b_open, b_close)
-            body_c_low, body_c_high = min(c_open, c_close), max(c_open, c_close)
-        except Exception:
-            continue
-        # bullish gap
-        if (b_close < b_open) and (body_c_low > body_a_high):
-            fvg_list.append((df.index[i-1], df.index[i+1], body_a_high, body_c_low))
-        # bearish gap
-        if (b_close > b_open) and (body_c_high < body_a_low):
-            fvg_list.append((df.index[i-1], df.index[i+1], body_c_high, body_a_low))
-    return fvg_list
+        a_open, a_close = df["open"].iloc[i-1], df["close"].iloc[i-1]
+        b_open, b_close = df["open"].iloc[i], df["close"].iloc[i]
+        c_open, c_close = df["open"].iloc[i+1], df["close"].iloc[i+1]
+        a_low, a_high = min(a_open,a_close), max(a_open,a_close)
+        b_low, b_high = min(b_open,b_close), max(b_open,b_close)
+        c_low, c_high = min(c_open,c_close), max(c_open,c_close)
+        # bullish FVG
+        if (b_close < b_open) and (c_low > a_high):
+            fvg.append((df.index[i-1], df.index[i+1], a_high, c_low))
+        # bearish FVG
+        if (b_close > b_open) and (c_high < a_low):
+            fvg.append((df.index[i-1], df.index[i+1], c_high, a_low))
+    return fvg
 
 def detect_order_blocks(df):
-    # approximate order blocks: look for last strong bearish candle before rally (bull OB)
     obs = []
-    for i in range(1, len(df)-2):
+    for i in range(1, len(df)-3):
         prev = df.iloc[i-1]
         cur = df.iloc[i]
-        nxt = df.iloc[i+1]
-        # bullish order block: prev bearish and then price rallies above prev.high within next few candles
+        future = df.iloc[i+1:i+5]
+        # bullish OB
         if prev["close"] < prev["open"]:
-            future_highs = df["high"].iloc[i+1:i+5]
-            if any(h > prev["high"] for h in future_highs):
+            if (future["high"] > prev["high"]).any():
                 obs.append(("bullish", prev.name, float(prev["low"]), float(prev["high"])))
-        # bearish order block
+        # bearish OB
         if prev["close"] > prev["open"]:
-            future_lows = df["low"].iloc[i+1:i+5]
-            if any(l < prev["low"] for l in future_lows):
+            if (future["low"] < prev["low"]).any():
                 obs.append(("bearish", prev.name, float(prev["low"]), float(prev["high"])))
     return obs
 
 def detect_liquidity(df):
-    # approximate liquidity zones: local highs/lows spikes
-    liquidity = []
-    highs = df["high"]
-    lows = df["low"]
+    liq = []
+    highs = df["high"]; lows = df["low"]
     for i in range(3, len(df)-3):
-        win_high = highs.iloc[i-3:i+4]
-        win_low = lows.iloc[i-3:i+4]
-        if highs.iloc[i] == win_high.max():
-            liquidity.append(("sell", df.index[i], highs.iloc[i]))
-        if lows.iloc[i] == win_low.min():
-            liquidity.append(("buy", df.index[i], lows.iloc[i]))
-    return liquidity
+        win_h = highs.iloc[i-3:i+4]
+        win_l = lows.iloc[i-3:i+4]
+        if highs.iloc[i] == win_h.max():
+            liq.append(("sell", df.index[i], highs.iloc[i]))
+        if lows.iloc[i] == win_l.min():
+            liq.append(("buy", df.index[i], lows.iloc[i]))
+    return liq
 
 # -----------------------
-# Chart drawing: candlesticks dark theme with overlays
-def make_candle_chart(df, sig, fvg_list, obs, liquidity_list):
-    # prepare mpf data
-    ohlc = df.loc[:, ["open","high","low","close"]].copy()
-    ohlc.index.name = "Date"
-
-    # style dark
+# Chart maker: candle dark + overlays (mplfinance)
+def make_chart_bytes(df, sig, fvg_list, obs, liq_list):
+    ohlc = df[["open","high","low","close"]].copy()
+    # prepare style dark
     s = mpf.make_mpf_style(base_mpf_style='nightclouds', rc={
-        'font.size': 9,
-        'axes.facecolor': '#0e0f11',
-        'figure.facecolor': '#0e0f11',
-        'savefig.facecolor': '#0e0f11'
+        'axes.facecolor': '#0e0f11', 'figure.facecolor': '#0e0f11'
     })
-
-    add_plots = []
-    # EMAs
+    addplots = []
     if "EMA20" in df.columns:
-        add_plots.append(mpf.make_addplot(df["EMA20"], color='cyan', width=0.8))
+        addplots.append(mpf.make_addplot(df["EMA20"], color='cyan', width=0.8))
     if "EMA50" in df.columns:
-        add_plots.append(mpf.make_addplot(df["EMA50"], color='magenta', width=0.8))
+        addplots.append(mpf.make_addplot(df["EMA50"], color='magenta', width=0.8))
 
-    # build custom rectangular overlays for FVG and OB
-    alphas = 0.25
-    mc = mpf.make_marketcolors(up='lime', down='red', edge='inherit', wick='inherit')
-    fig, axlist = mpf.plot(ohlc,
-                          type='candle',
-                          style=s,
-                          addplot=add_plots,
-                          returnfig=True,
-                          figsize=(8,4),
-                          tight_layout=True)
+    fig, axes = mpf.plot(ohlc, type='candle', style=s, addplot=addplots, returnfig=True, figsize=(8,4), tight_layout=True)
+    ax = axes[0]
 
-    ax = axlist[0]
-
-    # draw FVGs as translucent rectangles
+    # FVG rectangles
     for (start, end, low, high) in fvg_list:
-        # x coords: convert datetimes to axis positions
         try:
-            ax.axvspan(start, end, color='#ffd700', alpha=alphas)  # gold-ish
+            ax.axvspan(start, end, color='#ffd700', alpha=0.25)
             ax.text(end, (low+high)/2, 'FVG', color='black', fontsize=7, va='center', ha='right', backgroundcolor='#ffd700', alpha=0.6)
         except Exception:
             continue
 
-    # draw Order Blocks as thicker rectangles
+    # OB spans
     for ob in obs:
         typ, time_idx, low, high = ob
         color = '#00bfff' if typ=="bullish" else '#ff69b4'
         try:
-            # span 1 candle width after time_idx to current index
-            ax.axvspan(time_idx, df.index[-1], ymin=0, ymax=1, color=color, alpha=0.06)
+            ax.axvspan(time_idx, df.index[-1], color=color, alpha=0.06)
             ax.text(time_idx, high, 'OB', color=color, fontsize=7, va='bottom')
         except Exception:
             continue
 
-    # draw liquidity points
-    for liq in liquidity_list:
-        typ, t_idx, price = liq
+    # liquidity markers
+    for li in liq_list:
+        typ, t_idx, price = li
         marker = '^' if typ=='buy' else 'v'
-        col = 'white'
         try:
-            ax.plot([t_idx], [price], marker=marker, color=col, markersize=6, alpha=0.9)
-            ax.text(t_idx, price, 'LQ', color=col, fontsize=7, va='bottom' if typ=='buy' else 'top')
+            ax.plot([t_idx], [price], marker=marker, color='white', markersize=6)
+            ax.text(t_idx, price, 'LQ', color='white', fontsize=7, va='bottom' if typ=='buy' else 'top')
         except Exception:
             continue
 
-    # title with signal
-    title = f"{sig['symbol']}  {sig['signal']}  Price:{sig['price']:.4f}  RSI:{sig['rsi']:.1f}"
-    ax.set_title(title, color='white', fontsize=10)
+    # title
+    ax.set_title(f"{sig['symbol']}  {sig['signal']}  @{sig['price']:.4f}", color='white', fontsize=10)
 
-    # save to bytes
     buf = io.BytesIO()
     fig.savefig(buf, format='png', dpi=120, bbox_inches='tight', facecolor=fig.get_facecolor())
     plt.close(fig)
@@ -245,7 +241,7 @@ def make_candle_chart(df, sig, fvg_list, obs, liquidity_list):
     return buf
 
 # -----------------------
-# determine if data is fresh enough
+# freshness check
 def is_fresh(df, minutes=FRESHNESS_MINUTES):
     if df is None or df.empty:
         return False
@@ -254,8 +250,8 @@ def is_fresh(df, minutes=FRESHNESS_MINUTES):
     return (now - last_time) <= timedelta(minutes=minutes)
 
 # -----------------------
-# generate signal (EMA cross + RSI filter)
-def generate_signal_basic(df, symbol):
+# signal logic
+def generate_signal(df, symbol):
     df = compute_indicators(df)
     if df is None or df.empty:
         return {"symbol": symbol, "signal": "NO_DATA"}
@@ -265,87 +261,124 @@ def generate_signal_basic(df, symbol):
     ema50 = float(last["EMA50"]) if not math.isnan(last["EMA50"]) else math.nan
     rsi_val = float(last["RSI"]) if not math.isnan(last["RSI"]) else math.nan
 
-    signal = "HOLD"
-    tp = None
+    signal = "HOLD"; tp = None
     if not math.isnan(ema20) and not math.isnan(ema50):
         if ema20 > ema50 and rsi_val < 70:
-            signal = "BUY"
-            tp = price * 1.002
+            signal = "BUY"; tp = price * 1.002
         elif ema20 < ema50 and rsi_val > 30:
-            signal = "SELL"
-            tp = price * 0.998
+            signal = "SELL"; tp = price * 0.998
 
-    return {
-        "symbol": symbol,
-        "price": price,
-        "signal": signal,
-        "tp": tp,
-        "rsi": rsi_val,
-        "time": now_utc_str()
-    }
+    return {"symbol": symbol, "price": price, "signal": signal, "tp": tp, "rsi": rsi_val, "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")}
 
 # -----------------------
-# Main analyze & send (separate message per asset)
-def analyze_and_send():
-    for symbol in ASSETS:
+# analyze single symbol and send to all subs
+def analyze_symbol_and_send(app, symbol_binance):
+    df = get_klines_binance(symbol_binance)
+    if df is None or len(df) < 30:
+        print("No data for", symbol_binance); return
+    if not is_fresh(df):
+        print("Stale data for", symbol_binance); return
+
+    df = compute_indicators(df)
+    sig = generate_signal(df, symbol_binance)
+    fvg = detect_fvg(df)
+    obs = detect_order_blocks(df)
+    liq = detect_liquidity(df)
+
+    if sig["signal"] in ("BUY","SELL"):
         try:
-            df = get_data_td(symbol)
-            # require at least some candles
-            if df is None or len(df) < 20:
-                tg_send_message(f"⚠️ No/insufficient data for {symbol}")
-                continue
-            # check freshness (skip if stale)
-            if not is_fresh(df):
-                print(f"{symbol} data stale, skipping")
-                continue
-
-            df = compute_indicators(df)
-            sig = generate_signal_basic(df, symbol)
-
-            # detect ICT-ish structures
-            fvg = detect_fvg(df)
-            obs = detect_order_blocks(df)
-            liq = detect_liquidity(df)
-
-            caption = (
-                f"*ICT Smart Money Signal*\n"
-                f"Asset: `{sig['symbol']}`\n"
-                f"Time: `{sig['time']}`\n"
-                f"Price: `${sig['price']:.4f}`\n"
-                f"Signal: *{sig['signal']}*\n"
-                f"RSI: `{sig['rsi']:.1f}`\n"
-            )
-            if sig["tp"] is not None:
-                caption += f"🎯 TP: `{sig['tp']:.4f}`\n"
-            caption += "⚙️ Strategy: Michael ICT - Smart Money Concepts (approx)"
-
-            # send only when BUY or SELL (user wanted that behavior)
-            if sig["signal"] in ("BUY", "SELL"):
-                try:
-                    chart = make_candle_chart(df, sig, fvg, obs, liq)
-                    tg_send_photo(chart, caption)
-                    print(now_utc_str(), f"Sent {symbol} {sig['signal']}")
-                except Exception as e:
-                    tg_send_message(f"⚠️ Failed to create/send chart for {symbol}: {e}")
-            else:
-                print(now_utc_str(), f"{symbol}: HOLD")
-
+            chart = make_chart_bytes = make_chart_bytes  # no-op to reference
+        except:
+            pass
+        try:
+            chart_buf = make_chart_bytes(df, sig, fvg, obs, liq)
         except Exception as e:
-            tg_send_message(f"⚠️ Error analyzing {symbol}: {e}")
+            print("Chart creation error:", e)
+            chart_buf = None
+
+        caption = (
+            f"*ICT Smart Money Signal*\n"
+            f"Asset: `{sig['symbol']}`\n"
+            f"Time: `{sig['time']}`\n"
+            f"Price: `${sig['price']:.4f}`\n"
+            f"Signal: *{sig['signal']}*\n"
+            f"RSI: `{sig['rsi']:.1f}`\n"
+        )
+        if sig["tp"] is not None:
+            caption += f"🎯 TP: `{sig['tp']:.4f}`\n"
+        caption += "⚙️ Strategy: Michael ICT - approx"
+
+        # send to each subscriber
+        subs = load_subs()
+        if not subs:
+            print("No subscribers to send to.")
+            return
+        for chat_id in subs:
+            try:
+                if chart_buf:
+                    # Telegram expects file-like; reset pointer for each send
+                    chart_buf.seek(0)
+                    await_send_photo(chat_id, chart_buf, caption)
+                else:
+                    await_send_message(chat_id, caption)
+            except Exception as e:
+                print("Send to", chat_id, "failed:", e)
+    else:
+        print(sig["symbol"], "HOLD")
+
+# small sync wrappers to use requests-based send (we're inside async app)
+def await_send_message(chat_id, text):
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    try:
+        requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"}, timeout=15)
+    except Exception as e:
+        print("tg send msg failed:", e)
+
+def await_send_photo(chat_id, buf, caption):
+    url = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
+    files = {"photo": ("chart.png", buf)}
+    data = {"chat_id": chat_id, "caption": caption, "parse_mode": "Markdown"}
+    try:
+        requests.post(url, data=data, files=files, timeout=30)
+    except Exception as e:
+        print("tg send photo failed:", e)
 
 # -----------------------
-# Thread runner
-def run_loop():
-    while True:
-        analyze_and_send()
-        time.sleep(300)  # 5 minutes
+# job: analyze all symbols (runs in JobQueue)
+def job_analyze(context: ContextTypes.DEFAULT_TYPE):
+    # loop symbols
+    for short, sym in SYMBOLS.items():
+        try:
+            analyze_symbol_and_send(context.application, sym)
+        except Exception as e:
+            print("Error in analyze_symbol_and_send:", e)
+
+# -----------------------
+# manual analyze command
+async def analyze_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_message(chat_id=update.effective_chat.id, text="🔍 Running immediate analysis (this may take a few seconds)...")
+    # run analysis once synchronously (calls sends)
+    for short, sym in SYMBOLS.items():
+        analyze_symbol_and_send(context.application, sym)
+    await context.bot.send_message(chat_id=update.effective_chat.id, text="✅ Analysis complete.")
+
+# -----------------------
+# main: setup bot app, handlers, and jobqueue
+def main():
+    app = ApplicationBuilder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("stop", remove_sub))
+    app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("analyze", analyze_cmd))
+
+    # schedule job every 5 minutes (300s)
+    jq = app.job_queue
+    jq.run_repeating(job_analyze, interval=300, first=10)
+
+    print("Bot starting (polling)...")
+    app.run_polling()
 
 if __name__ == "__main__":
-    try:
-        tg_send_message("🚀 ICT Dark Candles Bot started (5m) — will send BUY/SELL per asset")
-    except Exception:
-        pass
-    t = threading.Thread(target=run_loop, daemon=True)
-    t.start()
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, threaded=True)
+    main()
