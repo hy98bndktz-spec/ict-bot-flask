@@ -1,9 +1,5 @@
-python-telegram-bot[job-queue]==20.6
-flask
 pandas
 matplotlib
-mplfinance
 requests
-ta
-setuptools>=65.5.0
-wheel
+python-telegram-bot==13.15
+yfinance
