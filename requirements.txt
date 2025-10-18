@@ -5,3 +5,4 @@ requests
 ta
 setuptools>=65.5.0
 wheel
+mplfinance
