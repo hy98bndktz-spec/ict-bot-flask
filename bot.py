@@ -17,7 +17,11 @@ CHAT_ID = "690864747"
 
 # الرموز المراد متابعتها
 BINANCE_SYMBOL = "BTCUSDT"      # بيتكوين
-YFINANCE_SYMBOL = "XAUUSD=X"    # ذهب مقابل الدولار
+YFINANCE_SYMBOL =  # إعداد رمز الذهب
+symbol = "GC=F"  # رمز الذهب في Yahoo Finance
+
+# جلب بيانات السعر
+data = yf.download(symbol, period="2d", interval="5m", progress=False)
 TIMEFRAME = "5m"                # فريم 5 دقائق
 FETCH_LIMIT = 500
 
