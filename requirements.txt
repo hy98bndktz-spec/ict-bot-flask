@@ -1,9 +1,6 @@
-python-telegram-bot==20.3
+flask
 requests
 pandas
-numpy
-matplotlib
 pandas_ta
 yfinance
-flask
-asyncio
+python-telegram-bot
