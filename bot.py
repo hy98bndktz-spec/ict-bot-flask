@@ -1,145 +1,71 @@
-# bot.py
-import os
-import time
-import requests
-import pandas as pd
-import pandas_ta as ta
+import logging
 import yfinance as yf
-from datetime import datetime, timezone
-from flask import Flask
-import threading
+import pandas as pd
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+import asyncio
+import os
 
-# إعدادات البوت
-TOKEN = "8461165121:AAG3rQ5GFkv-Jmw-6GxHaQ56p-tgXLopp_A"
-CHAT_ID = "690864747"
+# إعداد السجلّات
+logging.basicConfig(level=logging.INFO)
 
-# أزواج العملات
-ASSETS = {
-    "XAUUSD": "GC=F",    # الذهب
-    "BTCUSD": "BTC-USD", # بيتكوين
-    "EURUSD": "EURUSD=X" # اليورو مقابل الدولار
-}
+# ===== إعدادات البوت =====
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8461165121:AAG3rQ5GFkv-Jmw-6GxHaQ56p-tgXLopp_A")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "690864747"))
 
-TIMEFRAME_FAST = "5m"
-TIMEFRAME_SLOW = "1h"
-TG_URL = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return "🚀 ICT Smart Money Bot is live (5m/1h Strategy)"
-
-def send_telegram(text):
-    """إرسال رسالة إلى تيليجرام"""
+# ===== جلب البيانات =====
+def get_data(symbol: str, timeframe="1h", limit=200):
     try:
-        payload = {"chat_id": CHAT_ID, "text": text}
-        requests.post(TG_URL, json=payload, timeout=10)
+        df = yf.download(symbol, period="7d", interval=timeframe)
+        if df.empty:
+            return pd.DataFrame()
+        df.dropna(inplace=True)
+        return df
     except Exception as e:
-        print("Telegram Error:", e)
-
-def now_str():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-def fetch_data(symbol, interval="5m", period="2d"):
-    """جلب البيانات من Yahoo Finance"""
-    df = yf.download(tickers=symbol, period=period, interval=interval, progress=False)
-    if df.empty:
+        logging.error(f"Error fetching {symbol}: {e}")
         return pd.DataFrame()
-    df = df.dropna()
-    df.index = pd.to_datetime(df.index)
-    df = df.rename(columns={"Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"})
-    return df[["open","high","low","close","volume"]]
 
-def compute_indicators(df):
-    df["EMA12"] = ta.ema(df["close"], length=12)
-    df["EMA26"] = ta.ema(df["close"], length=26)
-    df["RSI14"] = ta.rsi(df["close"], length=14)
-    df["ATR"] = ta.atr(df["high"], df["low"], df["close"], length=14)
-    return df.dropna()
+# ===== تحليل الإشارات =====
+def generate_signal(df: pd.DataFrame):
+    try:
+        df["MA50"] = df["Close"].rolling(window=50).mean()
+        df["MA200"] = df["Close"].rolling(window=200).mean()
 
-def detect_structure(df):
-    highs, lows = df['high'], df['low']
-    if len(df) < 5:
-        return "sideways"
-    if highs.iloc[-1] > highs.iloc[-4] and lows.iloc[-1] > lows.iloc[-4]:
-        return "uptrend"
-    elif highs.iloc[-1] < highs.iloc[-4] and lows.iloc[-1] < lows.iloc[-4]:
-        return "downtrend"
-    return "sideways"
+        if df["MA50"].iloc[-1] > df["MA200"].iloc[-1]:
+            return "🟢 Buy Signal (Golden Cross)"
+        elif df["MA50"].iloc[-1] < df["MA200"].iloc[-1]:
+            return "🔴 Sell Signal (Death Cross)"
+        else:
+            return "⚪ Neutral (No clear signal)"
+    except Exception as e:
+        return f"⚠️ Error analyzing: {e}"
 
-def generate_signal(df_5m, df_1h):
-    """توليد إشارات وفق منهج ICT Smart Money"""
-    df_5m = compute_indicators(df_5m)
-    df_1h = compute_indicators(df_1h)
+# ===== أوامر البوت =====
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🚀 ICT Smart Money Bot started (1H/5M Strategy)\nUse /analyze to check signals.")
 
-    fast = df_5m.iloc[-1]
-    slow = df_1h.iloc[-1]
-    structure_h1 = detect_structure(df_1h)
+async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔍 Analyzing markets, please wait...")
 
-    signal = "HOLD"
-    reasons = []
+    symbols = ["XAUUSD=X", "BTC-USD", "EURUSD=X"]
+    timeframes = {"1h": "1 Hour", "5m": "5 Minutes"}
 
-    if slow["EMA12"] > slow["EMA26"] and structure_h1 == "uptrend":
-        if fast["EMA12"] > fast["EMA26"] and fast["RSI14"] < 70:
-            signal = "BUY"
-            reasons.append("EMA crossover + RSI below 70 + bullish structure (ICT bias)")
-
-    elif slow["EMA12"] < slow["EMA26"] and structure_h1 == "downtrend":
-        if fast["EMA12"] < fast["EMA26"] and fast["RSI14"] > 30:
-            signal = "SELL"
-            reasons.append("EMA crossover + RSI above 30 + bearish structure (ICT bias)")
-
-    return {
-        "time": now_str(),
-        "price": fast["close"],
-        "signal": signal,
-        "rsi": fast["RSI14"],
-        "structure_h1": structure_h1,
-        "reason": ", ".join(reasons) if reasons else "No clear entry"
-    }
-
-def analyze_and_send():
-    """تحليل كل زوج وإرسال الإشارات"""
-    for name, symbol in ASSETS.items():
-        try:
-            df_5m = fetch_data(symbol, interval=TIMEFRAME_FAST, period="2d")
-            df_1h = fetch_data(symbol, interval=TIMEFRAME_SLOW, period="7d")
-
-            if df_5m.empty or df_1h.empty:
-                print(f"⚠️ Missing data for {name}")
+    for symbol in symbols:
+        for tf, label in timeframes.items():
+            df = get_data(symbol, timeframe=tf)
+            if df.empty:
+                await update.message.reply_text(f"⚠️ No data for {symbol} ({label})")
                 continue
 
-            sig = generate_signal(df_5m, df_1h)
-            if sig["signal"] != "HOLD":
-                msg = (
-                    f"📊 ICT Smart Money Signal\n"
-                    f"Asset: {name}\n"
-                    f"Time: {sig['time']}\n"
-                    f"Price: {sig['price']:.2f}\n"
-                    f"Signal: {sig['signal']}\n"
-                    f"RSI: {sig['rsi']:.2f}\n"
-                    f"Structure (1H): {sig['structure_h1']}\n"
-                    f"Reason: {sig['reason']}\n"
-                    f"⚙️ Framework: Michael ICT - Smart Money Concepts\n"
-                    f"🕒 TF: 1H / Entry: 5M"
-                )
-                send_telegram(msg)
-            else:
-                print(f"{now_str()} - {name} HOLD")
+            result = generate_signal(df)
+            await update.message.reply_text(f"{symbol} ({label}): {result}")
 
-        except Exception as e:
-            err = f"⚠️ Error analyzing {name}: {e}"
-            print(err)
-            send_telegram(err)
-
-def loop_run():
-    """تشغيل التحليل بشكل دوري"""
-    while True:
-        analyze_and_send()
-        time.sleep(60 * 5)  # تحليل كل 5 دقائق
+# ===== دالة التشغيل =====
+def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("analyze", analyze))
+    app.run_polling()
 
 if __name__ == "__main__":
-    send_telegram("🚀 ICT Smart Money Bot started (1H/5M Strategy)")
-    threading.Thread(target=loop_run, daemon=True).start()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    main()
