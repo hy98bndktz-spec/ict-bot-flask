@@ -6,13 +6,15 @@ import mplfinance as mpf
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 import ta
-from datetime import datetime, timedelta
+from datetime import datetime
 from flask import Flask
+import threading
 
+# ========== المتغيرات ==========
 TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-# ========== الدوال ==========
+# ========== دوال التحليل ==========
 
 def get_klines(symbol="BTCUSDT", interval="5m", limit=100):
     url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
@@ -46,11 +48,11 @@ def generate_chart(df, filename="chart.png"):
     mpf.plot(df, type="candle", style=s, volume=True, title="BTC/USDT (ICT Style)", savefig=filename)
 
 
+# ========== مهام البوت ==========
 async def send_analysis(context: ContextTypes.DEFAULT_TYPE):
     df = get_klines()
     analysis = analyze_market(df)
     generate_chart(df)
-
     await context.bot.send_photo(
         chat_id=CHAT_ID,
         photo=open("chart.png", "rb"),
@@ -61,28 +63,25 @@ async def send_analysis(context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ البوت شغال ويحلل السوق كل 5 دقايق تلقائياً.")
 
-# ========== التشغيل ==========
 
-def main():
+# ========== تشغيل البوت ==========
+def run_bot():
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-
     job_queue = app.job_queue
     job_queue.run_repeating(send_analysis, interval=300, first=10)
-
     app.run_polling()
 
-# ========== لربط Render وتشغيل السيرفر ==========
 
+# ========== Flask (لـ Render) ==========
+flask_app = Flask(__name__)
+
+@flask_app.route("/")
+def home():
+    return "Bot is running!"
+
+# تشغيل Flask والبوت في وقت واحد
 if __name__ == "__main__":
-    main()
-
-    # الجزء اللي يخلي Render يتعرف إن البوت شغال
-    flask_app = Flask(__name__)
-
-    @flask_app.route("/")
-    def home():
-        return "Bot is running!"
-
+    threading.Thread(target=run_bot).start()
     port = int(os.environ.get("PORT", 5000))
     flask_app.run(host="0.0.0.0", port=port)
