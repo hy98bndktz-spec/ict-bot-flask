@@ -1,5 +1,9 @@
-python-telegram-bot==20.3
-pandas
-numpy
-ta
-matplotlib
+requests==2.31.0
+pandas==2.2.2
+numpy==1.26.4
+pandas_ta==0.7.0b3
+yfinance==0.2.25
+flask==2.3.4
+matplotlib==3.8.1
+python-telegram-bot==20.5
+pytz==2024.4
