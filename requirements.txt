@@ -2,7 +2,4 @@ python-telegram-bot[job-queue]==20.3
 pandas
 matplotlib
 requests
-ta
-setuptools>=65.5.0
-wheel
-mplfinance
+Flask==2.3.3
