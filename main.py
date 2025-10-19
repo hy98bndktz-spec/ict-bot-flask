@@ -1,119 +1,174 @@
-import telebot
-import matplotlib.pyplot as plt
-import numpy as np
-import io
-import threading
-import time
-import datetime
+# main.py
+# Telegram trading signal bot (experimental)
 
-# 🔹 توكن البوت الخاص بك
 BOT_TOKEN = "8461165121:AAG3rQ5GFkv-Jmw-6GxHaQ56p-tgXLopp_A"
-bot = telebot.TeleBot(BOT_TOKEN)
+TARGET_CHAT_ID = "690864747"  # تم وضع رقم الشات اللي عطيتني إياه
 
-# 🔹 الأزواج المراد تحليلها
-PAIRS = ["XAU/USD (Gold)", "BTC/USD (Bitcoin)", "EUR/JPY (Euro/Yen)"]
+import time
+import io
+from datetime import datetime, timezone
+import requests
+import pandas as pd
+import numpy as np
+import yfinance as yf
+from pycoingecko import CoinGeckoAPI
+import mplfinance as mpf
+from apscheduler.schedulers.background import BackgroundScheduler
+from telegram import Bot, InputFile
 
-# 🔹 التحقق من وقت السوق (يُغلق الجمعة 22:00 ويُفتح الأحد 22:00 بتوقيت GMT)
-def market_is_open():
-    now = datetime.datetime.utcnow()
-    # 0=الاثنين ... 6=الأحد
-    if now.weekday() == 5 and now.hour >= 22:  # الجمعة بعد 22:00
-        return False
-    if now.weekday() == 6 and now.hour < 22:   # الأحد قبل 22:00
+bot = Bot(token=BOT_TOKEN)
+cg = CoinGeckoAPI()
+
+SYMBOLS = [
+    {"name": "Bitcoin", "type": "crypto", "id": "bitcoin", "label": "BTC/USDT"},
+    {"name": "Gold", "type": "yfinance", "ticker": "GC=F", "label": "XAU/USD"},
+    {"name": "EUR/USD", "type": "yfinance", "ticker": "EURUSD=X", "label": "EUR/USD"},
+    {"name": "USD/JPY", "type": "yfinance", "ticker": "JPY=X", "label": "USD/JPY"},
+]
+
+def rsi(series, period=14):
+    delta = series.diff()
+    up = delta.clip(lower=0)
+    down = -1 * delta.clip(upper=0)
+    ma_up = up.ewm(com=period - 1, adjust=False).mean()
+    ma_down = down.ewm(com=period - 1, adjust=False).mean()
+    rs = ma_up / ma_down
+    return 100 - (100 / (1 + rs))
+
+def atr(df, period=14):
+    high_low = df['High'] - df['Low']
+    high_close = (df['High'] - df['Close'].shift()).abs()
+    low_close = (df['Low'] - df['Close'].shift()).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    return tr.rolling(period).mean().iloc[-1]
+
+def fetch_crypto_ohlcv(coin_id, vs_currency='usd'):
+    data = cg.get_coin_market_chart_by_id(id=coin_id, vs_currency=vs_currency, days=2)
+    prices = data['prices']
+    df = pd.DataFrame(prices, columns=['ts', 'price'])
+    df['datetime'] = pd.to_datetime(df['ts'], unit='ms')
+    df = df.set_index('datetime').drop(columns=['ts'])
+    return df['price']
+
+def fetch_yfinance_ohlcv(ticker, period="7d", interval="1m"):
+    try:
+        data = yf.download(tickers=ticker, period=period, interval=interval, progress=False, threads=False)
+        if data is None or data.empty:
+            return pd.DataFrame()
+        data.index = pd.to_datetime(data.index)
+        return data[['Open','High','Low','Close','Volume']]
+    except Exception as e:
+        print("yf error", e)
+        return pd.DataFrame()
+
+def build_ohlc_from_series(price_series, resample_rule='60T'):
+    ohlc = price_series.resample(resample_rule).ohlc()
+    ohlc['Volume'] = 0
+    ohlc.dropna(inplace=True)
+    return ohlc
+
+def is_market_open(symbol):
+    if symbol['type'] == 'crypto':
+        return True
+    now = datetime.now(timezone.utc)
+    if now.weekday() >= 5:
         return False
     return True
 
-# 🔹 دالة رسم شارت داكن بسيط بالشموع اليابانية
-def create_chart(pair):
-    np.random.seed(int(time.time()) % 10000)
-    prices = np.random.normal(0, 1, 50).cumsum() + 100
-
-    fig, ax = plt.subplots()
-    fig.set_facecolor("#0d1117")
-    ax.set_facecolor("#0d1117")
-
-    for i in range(len(prices) - 1):
-        color = "#00ff00" if prices[i + 1] > prices[i] else "#ff3333"
-        ax.plot([i, i + 1], [prices[i], prices[i + 1]], color=color, linewidth=2)
-
-    ax.set_title(f"{pair} Analysis", color="white", fontsize=14)
-    ax.tick_params(colors="gray")
-    plt.tight_layout()
-
-    img_bytes = io.BytesIO()
-    plt.savefig(img_bytes, format='png', facecolor=fig.get_facecolor())
-    img_bytes.seek(0)
-    plt.close(fig)
-    return img_bytes, prices
-
-# 🔹 تحليل الاتجاه العام من الشارت
-def analyze_trend(prices):
-    diff = prices[-1] - prices[0]
-    volatility = np.std(np.diff(prices))
-
-    if abs(diff) < volatility:
-        return "السوق يتحرك عرضيًا مع ضعف في الزخم 📉"
-    elif diff > 0:
-        return "السوق في اتجاه صاعد متوسط المدى 📈"
+def analyze_ohlc(df):
+    if df is None or df.empty:
+        return {"signal":"no_data"}
+    close = df['Close']
+    r = rsi(close)
+    sma_short = close.rolling(window=9).mean()
+    sma_long = close.rolling(window=21).mean()
+    last_rsi = r.iloc[-1]
+    last_close = close.iloc[-1]
+    last_sma_short = sma_short.iloc[-1]
+    last_sma_long = sma_long.iloc[-1]
+    if last_rsi < 30 and last_sma_short > last_sma_long:
+        side = "BUY"
+    elif last_rsi > 70 and last_sma_short < last_sma_long:
+        side = "SELL"
     else:
-        return "السوق في اتجاه هابط قصير المدى 🔻"
-
-# 🔹 دالة توليد توصية
-def generate_signal():
-    direction = np.random.choice(["شراء 🔵", "بيع 🔴"])
-    entry = round(np.random.uniform(99, 101), 2)
-    if "شراء" in direction:
-        tp = round(entry + np.random.uniform(0.5, 1.2), 2)
-        sl = round(entry - np.random.uniform(0.3, 0.8), 2)
+        side = "HOLD"
+    try:
+        a = atr(df)
+    except:
+        a = (df['High'].max() - df['Low'].min()) * 0.5
+    if side == "BUY":
+        sl = last_close - a * 1.5
+        tp = last_close + a * 3
+    elif side == "SELL":
+        sl = last_close + a * 1.5
+        tp = last_close - a * 3
     else:
-        tp = round(entry - np.random.uniform(0.5, 1.2), 2)
-        sl = round(entry + np.random.uniform(0.3, 0.8), 2)
-    return direction, entry, tp, sl
+        sl = None
+        tp = None
+    return {
+        "signal": side,
+        "rsi": round(float(last_rsi),2),
+        "close": float(last_close),
+        "sl": float(sl) if sl else None,
+        "tp": float(tp) if tp else None,
+        "atr": float(a)
+    }
 
-# 🔹 إرسال التحليل الكامل
-def send_analysis(chat_id):
-    if not market_is_open():
-        print("⏸ السوق مغلق - لن يتم الإرسال حالياً")
-        return
+def plot_candles(df, title="Chart"):
+    buf = io.BytesIO()
+    mc = mpf.make_marketcolors(up='g', down='r', inherit=True)
+    s = mpf.make_mpf_style(base_mpf_style='nightclouds', marketcolors=mc)
+    try:
+        mpf.plot(df, type='candle', style=s, title=title, ylabel='Price', savefig=dict(fname=buf, dpi=100, bbox_inches='tight'))
+        buf.seek(0)
+        return buf
+    except Exception as e:
+        print("mpl error", e)
+        return None
 
-    for pair in PAIRS:
-        chart, prices = create_chart(pair)
-        direction, entry, tp, sl = generate_signal()
-        summary = analyze_trend(prices)
-
-        msg = (
-            f"📊 **تحليل فني تلقائي - {pair}**\n\n"
-            f"الإشارة الحالية: {direction}\n"
-            f"سعر الدخول: `{entry}`\n"
-            f"🎯 Take Profit: `{tp}`\n"
-            f"🛑 Stop Loss: `{sl}`\n\n"
-            f"📈 التوقع العام: {summary}\n\n"
-            f"نظرة فنية:\n"
-            f"تم التحليل باستخدام مفهوم ICT على فريم الساعة والدخول من فريم 5 دقائق.\n"
-            f"يتم الإرسال فقط أثناء السوق المفتوح.\n\n"
-            f"🤖 _ICT Auto System_"
-        )
-
-        bot.send_photo(chat_id, chart, caption=msg, parse_mode="Markdown")
-
-# 🔹 التشغيل التلقائي كل 5 دقائق أثناء السوق
-def auto_send(chat_id):
-    while True:
+def job_send_signals():
+    now = datetime.now(timezone.utc)
+    print("Running job at", now.isoformat())
+    for sym in SYMBOLS:
         try:
-            if market_is_open():
-                print("🚀 إرسال تحليل جديد...")
-                send_analysis(chat_id)
+            if not is_market_open(sym):
+                print(f"Market closed for {sym['label']}, skipping.")
+                continue
+            if sym['type'] == 'crypto':
+                s = fetch_crypto_ohlcv(sym['id'])
+                ohlc = build_ohlc_from_series(s, resample_rule='60T')
             else:
-                print("🕒 السوق مغلق - لا إرسال الآن.")
+                ohlc = fetch_yfinance_ohlcv(sym['ticker'])
+                if ohlc.empty:
+                    continue
+                ohlc = ohlc.resample('60T').agg({'Open':'first','High':'max','Low':'min','Close':'last','Volume':'sum'})
+                ohlc.dropna(inplace=True)
+            analysis = analyze_ohlc(ohlc)
+            if analysis['signal'] in ["HOLD","no_data"]:
+                continue
+            df_plot = ohlc.tail(50)
+            buf = plot_candles(df_plot, title=f"{sym['label']} - {analysis['signal']}")
+            msg = f"*{sym['label']}* — _{analysis['signal']}_\n"
+            msg += f"Price: `{analysis['close']:.4f}`\nRSI: `{analysis['rsi']}`  ATR: `{analysis['atr']:.4f}`\n"
+            if analysis['sl'] and analysis['tp']:
+                msg += f"SL: `{analysis['sl']:.4f}`  TP: `{analysis['tp']:.4f}`\n"
+            msg += f"\n_Timeframe: 1H (entry 5m)_\nICT Concept – demo_"
+            if buf:
+                buf.seek(0)
+                bot.send_photo(chat_id=TARGET_CHAT_ID, photo=InputFile(buf, filename=f"{sym['label']}.png"), caption=msg, parse_mode='Markdown')
+                print("sent", sym['label'])
+            else:
+                bot.send_message(chat_id=TARGET_CHAT_ID, text=msg, parse_mode='Markdown')
         except Exception as e:
-            print(f"⚠️ خطأ أثناء الإرسال: {e}")
-        time.sleep(300)  # كل 5 دقائق
+            print("error for", sym, e)
 
-# 🔹 تفعيل البوت
-@bot.message_handler(commands=['start'])
-def start(message):
-    bot.reply_to(message, "✅ تم تفعيل التحليل التلقائي أثناء السوق فقط.")
-    threading.Thread(target=auto_send, args=(message.chat.id,), daemon=True).start()
-
-print("✅ Bot is running (every 5 min if market open)...")
-bot.polling()
+if __name__ == "__main__":
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(job_send_signals, 'interval', minutes=5, next_run_time=datetime.now())
+    scheduler.start()
+    print("Bot started — will send updates every 5 minutes.")
+    try:
+        while True:
+            time.sleep(10)
+    except KeyboardInterrupt:
+        scheduler.shutdown()
