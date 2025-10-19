@@ -9,7 +9,7 @@ import io
 from datetime import datetime, timezone
 import requests
 import pandas as pd
-import numpy as np
+import numpy as np 
 import yfinance as yf
 from pycoingecko import CoinGeckoAPI
 import mplfinance as mpf
