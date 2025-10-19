@@ -17,5 +17,5 @@ RUN pip install -r requirements.txt
 # تعيين المنفذ الافتراضي لـ Render
 EXPOSE 10000
 
-# تشغيل التطبيق باستخدام gunicorn (تم تعديل الاسم من app إلى main)
-CMD gunicorn main:app --bind 0.0.0.0:10000
+# تشغيل التطبيق باستخدام gunicorn
+CMD gunicorn main:app --bind 0.0.0.0:${PORT:-10000}
