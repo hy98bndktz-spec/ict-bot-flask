@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: ict-bot-flask
+    env: python
+    region: oregon
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python test_bot.py"
