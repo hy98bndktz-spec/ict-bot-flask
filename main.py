@@ -11,7 +11,7 @@ app = Flask(__name__)
 TOKEN = "8461165121:AAG3rQ5GFkv-Jmw-6GxHaQ56p-tgXLopp_A"
 CHAT_ID = "690864747"
 
-# مفتاح Alpha Vantage (مفتاحك)
+# مفتاح Alpha Vantage
 ALPHA_API_KEY = "f82dced376934dc0ab99e79afd3ca844"
 
 # قائمة الأزواج
@@ -37,14 +37,21 @@ def send_telegram_message(message):
 
 
 def get_price(symbol):
-    """جلب السعر من Alpha Vantage"""
+    """جلب السعر من Alpha Vantage مع طباعة الرد للتصحيح"""
     try:
         url = f"https://www.alphavantage.co/query?function=CURRENCY_EXCHANGE_RATE&from_currency={symbol[:3]}&to_currency={symbol[-3:]}&apikey={ALPHA_API_KEY}"
         r = requests.get(url)
         data = r.json()
 
-        price = float(data["Realtime Currency Exchange Rate"]["5. Exchange Rate"])
-        return price
+        # طباعة الرد من الموقع داخل Render logs
+        print(f"📡 Response for {symbol}: {data}")
+
+        if "Realtime Currency Exchange Rate" in data:
+            price = float(data["Realtime Currency Exchange Rate"]["5. Exchange Rate"])
+            return price
+        else:
+            print(f"⚠️ Unexpected response for {symbol}: {data}")
+            return None
     except Exception as e:
         print(f"⚠️ Error getting price for {symbol}: {e}")
         return None
@@ -73,7 +80,7 @@ def home():
     return "Bot is running ✅"
 
 
-# هذا القسم هو لتشغيل الكود بشكل متوافق مع Render
+# للتشغيل في Render
 if __name__ == '__main__':
     # للتشغيل المحلي فقط
     Thread(target=analyze_and_send, daemon=True).start()
