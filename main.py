@@ -1,4 +1,3 @@
-# main.py
 import os
 import time
 import requests
@@ -42,7 +41,6 @@ def get_price(symbol):
         url = f"https://www.alphavantage.co/query?function=CURRENCY_EXCHANGE_RATE&from_currency={symbol[:3]}&to_currency={symbol[-3:]}&apikey={ALPHA_API_KEY}"
         r = requests.get(url)
         data = r.json()
-
         price = float(data["Realtime Currency Exchange Rate"]["5. Exchange Rate"])
         return price
     except Exception as e:
@@ -54,7 +52,6 @@ def analyze_and_send():
     """تحليل الأسعار وإرسالها كل 5 دقائق"""
     while True:
         print("🔄 Running analysis cycle...")
-
         for name, symbol in SYMBOLS.items():
             price = get_price(symbol)
             if price:
@@ -74,6 +71,9 @@ def home():
 
 
 if __name__ == '__main__':
+    # 🔔 إرسال رسالة عند بدء التشغيل
+    send_telegram_message("✅ البوت متصل الآن ويعمل على Render!")
+
     # تشغيل حلقة التحليل في الخلفية
     Thread(target=analyze_and_send, daemon=True).start()
     app.run(host='0.0.0.0', port=10000)
