@@ -6,7 +6,8 @@ from telegram import Bot
 from telegram.ext import Application, CommandHandler
 from datetime import datetime
 import asyncio
-from flask import Flask  # ✅ أضفنا Flask لتشغيل Render
+from flask import Flask
+import threading
 
 # ======================
 # Flask لإبقاء السيرفر شغال في Render
@@ -56,7 +57,7 @@ def ict_analysis(symbol, price):
         if price is None:
             return f"⚠️ لم أستطع جلب السعر لـ {symbol}"
         
-        # تحليل بسيط مبدئي (لتجارب أولية)
+        # تحليل بسيط مبدئي
         trend = "صاعد 📈" if int(str(price).replace('.', '')[-1]) % 2 == 0 else "هابط 📉"
         bos = "تم كسر هيكل السوق" if price % 2 == 0 else "هيكل السوق مستقر"
         fvg = "توجد فجوة سعرية (FVG) محتملة"
@@ -109,16 +110,17 @@ async def periodic_task():
 # تشغيل التطبيق
 # ======================
 async def main():
+    bot = Bot(token=BOT_TOKEN)
+    # ✅ رسالة اختبار للتأكد أن البوت متصل بتليجرام
+    await bot.send_message(chat_id=CHAT_ID, text="✅ البوت اشتغل الآن من Render!")
+
     app_telegram = Application.builder().token(BOT_TOKEN).build()
     app_telegram.add_handler(CommandHandler("start", start))
     app_telegram.add_handler(CommandHandler("analyze", analyze))
+
     asyncio.create_task(periodic_task())
     await app_telegram.run_polling()
 
 if __name__ == "__main__":
-    # تشغيل Flask في الخلفية على Render
-    import threading
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=10000)).start()
-
-    # تشغيل البوت التلقائي
     asyncio.run(main())
