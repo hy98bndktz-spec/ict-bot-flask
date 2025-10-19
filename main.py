@@ -1,6 +1,5 @@
 # main.py
-# ICT Smart Money Bot (Render + Binance + TwelveData)
-# يجلب الأسعار من Binance (للعملات الرقمية) و TwelveData (للأزواج العادية)
+# ICT Smart-Money Telegram Signal Bot (Render ready, Auto-start + KeepAlive)
 
 import os
 import time
@@ -10,212 +9,178 @@ import traceback
 import requests
 from datetime import datetime, timezone, timedelta
 from threading import Thread
-
-# plotting
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import mplfinance as mpf
-import pandas as pd
-
 from flask import Flask
 
-# ========================
-# CONFIG
+# -----------------------
+# إعدادات البوت
 TOKEN = "8461165121:AAG3rQ5GFkv-Jmw-6GxHaQ56p-tgXLopp_A"
 CHAT_ID = "690864747"
-TWELVE_API_KEY = "f82dced376934dc0ab99e79afd3ca844"
 
-# أزواج العملات
+# رموز الأزواج
 SYMBOLS = {
-    "BTC": "BTCUSDT",
-    "ETH": "ETHUSDT",
-    "GOLD": "XAU/USD",
-    "EURUSD": "EUR/USD",
-    "GBPUSD": "GBP/USD",
-    "USDJPY": "USD/JPY"
+    "BTC": "BTC-USD",
+    "GOLD": "GC=F",
+    "ETH": "ETH-USD",
+    "EURUSD": "EURUSD=X",
+    "USDJPY": "JPY=X",
+    "GBPUSD": "GBPUSD=X"
 }
 
-CHECK_INTERVAL = 300  # 5 دقائق
+# الإعدادات العامة
+TIMEFRAME_BIG = "1h"
+CHECK_INTERVAL = 300  # كل 5 دقائق
 
+# -----------------------
+# روابط التلغرام
 TG_SEND = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
 TG_SEND_PHOTO = f"https://api.telegram.org/bot{TOKEN}/sendPhoto"
 
-# ========================
+# Flask app
 app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "🚀 ICT Smart Money Bot — Running with Binance + TwelveData"
+    return "🚀 ICT Smart Money Bot — Running"
 
-# ========================
+# -----------------------
+# أدوات مساعدة
 def now_utc_str():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 def send_telegram_text(text):
     try:
-        requests.post(TG_SEND, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}, timeout=10)
+        payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
+        r = requests.post(TG_SEND, json=payload, timeout=10)
+        if not r.ok:
+            print("Telegram text send failed:", r.status_code, r.text)
+        return r.ok
     except Exception as e:
         print("Telegram send error:", e)
+        return False
 
 def send_telegram_photo(file_bytes_io, caption=""):
     try:
         file_bytes_io.seek(0)
-        requests.post(
-            TG_SEND_PHOTO,
-            data={"chat_id": CHAT_ID, "caption": caption, "parse_mode": "Markdown"},
-            files={"photo": ("chart.png", file_bytes_io.getvalue())},
-            timeout=30
-        )
+        files = {"photo": ("chart.png", file_bytes_io.getvalue())}
+        data = {"chat_id": CHAT_ID, "caption": caption, "parse_mode": "Markdown"}
+        r = requests.post(TG_SEND_PHOTO, data=data, files=files, timeout=30)
+        if not r.ok:
+            print("Telegram photo send failed:", r.status_code, r.text)
+        return r.ok
     except Exception as e:
-        print("Telegram photo send error:", e)
+        print("Telegram send photo error:", e)
+        return False
 
-# ========================
-# EMA + RSI
-def ema(series, span):
-    return series.ewm(span=span, adjust=False).mean()
+# -----------------------
+# بيانات من Yahoo Finance
+import pandas as pd
+import yfinance as yf
 
+def fetch_yf(symbol, period="2d", interval="1h"):
+    try:
+        df = yf.download(tickers=symbol, period=period, interval=interval, progress=False, auto_adjust=False)
+        if df is None or df.empty:
+            return None
+        df.index = pd.to_datetime(df.index)
+        return df[["Open","High","Low","Close","Volume"]]
+    except Exception as e:
+        print(f"fetch_yf error for {symbol}:", e)
+        return None
+
+# -----------------------
+# مؤشرات بسيطة
+def ema(series, span): return series.ewm(span=span, adjust=False).mean()
 def rsi(series, period=14):
     delta = series.diff()
-    up = delta.clip(lower=0)
-    down = -delta.clip(upper=0)
+    up, down = delta.clip(lower=0), -delta.clip(upper=0)
     ma_up = up.ewm(alpha=1/period, adjust=False).mean()
     ma_down = down.ewm(alpha=1/period, adjust=False).mean()
     rs = ma_up / (ma_down + 1e-9)
     return 100 - (100/(1+rs))
 
-# ========================
-# Fetch functions
-def fetch_binance(symbol, interval="1h", limit=200):
+# -----------------------
+# توليد إشارة تداول
+def generate_signal_from_df(df):
     try:
-        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
-        r = requests.get(url, timeout=10)
-        data = r.json()
-        df = pd.DataFrame(data, columns=[
-            "Open time", "Open", "High", "Low", "Close", "Volume",
-            "Close time", "QAV", "trades", "TB_base", "TB_quote", "ignore"
-        ])
-        df["Open time"] = pd.to_datetime(df["Open time"], unit="ms")
-        df.set_index("Open time", inplace=True)
-        df = df.astype(float)
-        return df[["Open", "High", "Low", "Close", "Volume"]]
-    except Exception as e:
-        print(f"fetch_binance error for {symbol}:", e)
-        return None
-
-def fetch_twelvedata(symbol, interval="1h", outputsize=200):
-    try:
-        url = (
-            f"https://api.twelvedata.com/time_series?"
-            f"symbol={symbol}&interval={interval}&outputsize={outputsize}&apikey={TWELVE_API_KEY}"
-        )
-        r = requests.get(url, timeout=10)
-        data = r.json()
-        if "values" not in data:
-            print("twelvedata error:", data)
-            return None
-        df = pd.DataFrame(data["values"])
-        df["datetime"] = pd.to_datetime(df["datetime"])
-        df = df.rename(columns=str.capitalize)
-        df.set_index("Datetime", inplace=True)
-        df = df.astype(float)
-        df = df.sort_index()
-        return df[["Open", "High", "Low", "Close", "Volume"]]
-    except Exception as e:
-        print(f"fetch_twelvedata error for {symbol}:", e)
-        return None
-
-# ========================
-def generate_signal(df):
-    try:
-        df["EMA20"] = ema(df["Close"], 20)
-        df["EMA50"] = ema(df["Close"], 50)
-        df["RSI"] = rsi(df["Close"], 14)
-        last = df.iloc[-1]
+        df2 = df.copy()
+        df2["EMA20"], df2["EMA50"] = ema(df2["Close"],20), ema(df2["Close"],50)
+        df2["RSI"] = rsi(df2["Close"],14)
+        last = df2.iloc[-1]
         price = float(last["Close"])
-        ema20 = last["EMA20"]
-        ema50 = last["EMA50"]
-        rsi_val = last["RSI"]
-
+        ema20, ema50, rsi_val = float(last["EMA20"]), float(last["EMA50"]), float(last["RSI"])
         signal = "HOLD"
         if ema20 > ema50 and rsi_val < 70:
             signal = "BUY"
         elif ema20 < ema50 and rsi_val > 30:
             signal = "SELL"
-
-        return {"price": price, "rsi": rsi_val, "signal": signal}
+        return {"time": now_utc_str(), "price": price, "signal": signal, "rsi": rsi_val}
     except Exception as e:
         print("signal error:", e)
-        return {"signal": "HOLD"}
+        return {"time": now_utc_str(), "signal":"HOLD"}
 
-# ========================
-def generate_chart(df, symbol, signal_info):
-    try:
-        df["EMA20"] = ema(df["Close"], 20)
-        df["EMA50"] = ema(df["Close"], 50)
-        apds = [
-            mpf.make_addplot(df["EMA20"], width=0.8),
-            mpf.make_addplot(df["EMA50"], width=0.8)
-        ]
-        style = mpf.make_mpf_style(base_mpf_style="nightclouds")
-        fig, ax = mpf.plot(df.tail(100), type="candle", style=style, addplot=apds, figsize=(9,4), returnfig=True)
-        ax[0].set_title(f"{symbol} | {signal_info['signal']}", color="white")
-        buf = io.BytesIO()
-        fig.savefig(buf, format="png", bbox_inches="tight", dpi=120)
-        plt.close(fig)
-        return buf
-    except Exception as e:
-        print("chart error:", e)
-        return None
+# -----------------------
+# التحقق من حداثة البيانات
+def data_is_fresh(df, max_age_minutes=30):
+    if df is None or df.empty: return False
+    last_ts = df.index[-1]
+    if last_ts.tzinfo is None:
+        last_ts = last_ts.tz_localize(timezone.utc)
+    age = datetime.now(timezone.utc) - last_ts
+    return age <= timedelta(minutes=max_age_minutes)
 
-# ========================
+# -----------------------
+# التحليل والإرسال
 def analyze_and_send_all():
-    send_telegram_text(f"🚀 ICT Bot started successfully — {now_utc_str()}")
-
+    print(f"{now_utc_str()} - Background loop started.")
+    send_telegram_text(f"🚀 ICT Bot started successfully. Time: {now_utc_str()}")
     while True:
-        for name, symbol in SYMBOLS.items():
-            try:
-                # اختار المصدر حسب نوع الزوج
-                if symbol.endswith("USDT"):
-                    df = fetch_binance(symbol)
-                else:
-                    df = fetch_twelvedata(symbol)
-
-                if df is None or df.empty:
-                    print(f"{name} — skipped (no data)")
-                    continue
-
-                sig = generate_signal(df)
+        try:
+            for short, sym in SYMBOLS.items():
+                df = fetch_yf(sym, period="5d", interval="1h")
+                if not data_is_fresh(df): continue
+                sig = generate_signal_from_df(df)
                 if sig["signal"] in ("BUY", "SELL"):
                     caption = (
-                        f"*{name}* `{symbol}`\n"
-                        f"Signal: *{sig['signal']}*\n"
+                        f"*ICT Smart Money Signal*  `{short}`\n"
+                        f"Time: `{sig['time']}`\n"
                         f"Price: `{sig['price']:.4f}`\n"
-                        f"RSI: `{sig['rsi']:.2f}`\n"
-                        f"Time: `{now_utc_str()}`"
+                        f"Signal: *{sig['signal']}*\n"
+                        f"RSI: `{sig['rsi']:.1f}`\n"
                     )
-                    chart_buf = generate_chart(df, name, sig)
-                    if chart_buf:
-                        send_telegram_photo(chart_buf, caption)
-                    else:
-                        send_telegram_text(caption)
-                    print(f"{now_utc_str()} - Sent {sig['signal']} for {name}")
+                    send_telegram_text(caption)
+                    print(f"{now_utc_str()} - Sent {sig['signal']} for {short}")
                 else:
-                    print(f"{now_utc_str()} - {name}: HOLD")
+                    print(f"{now_utc_str()} - {short} HOLD")
+            time.sleep(CHECK_INTERVAL)
+        except Exception as e:
+            print("Main loop error:", e)
+            time.sleep(10)
 
-            except Exception as e:
-                print(f"Loop error for {name}:", e, traceback.format_exc())
-                continue
+# -----------------------
+# Keep-alive ping (حتى ما ينام السيرفر المجاني)
+def keep_alive():
+    while True:
+        try:
+            url = "https://ict-bot-flask.onrender.com"
+            requests.get(url, timeout=10)
+            print(f"{now_utc_str()} - Ping keep-alive ✅")
+        except Exception:
+            pass
+        time.sleep(600)  # كل 10 دقايق
 
-        time.sleep(CHECK_INTERVAL)
-
-# ========================
+# -----------------------
+# تشغيل الخلفية وFlask
 def start_background():
-    t = Thread(target=analyze_and_send_all, daemon=True)
-    t.start()
+    Thread(target=analyze_and_send_all, daemon=True).start()
+    Thread(target=keep_alive, daemon=True).start()
 
+# -----------------------
+# التشغيل التلقائي سواء محلي أو عبر Gunicorn
 if __name__ == "__main__":
     start_background()
     port = int(os.environ.get("PORT", 10000))
     print(f"{now_utc_str()} - Starting Flask on port {port}")
     app.run(host="0.0.0.0", port=port)
+else:
+    print(f"{now_utc_str()} - Gunicorn worker starting background thread...")
+    start_background()
