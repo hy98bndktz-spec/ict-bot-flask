@@ -1,54 +1,77 @@
 import os
-import requests
+import time
 import logging
 import threading
-import asyncio
-from datetime import datetime
+import requests
 from flask import Flask
-from telegram import Bot
-from telegram.ext import Application, CommandHandler
+
+# إعداد اللوجز
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # إعداد Flask
 app = Flask(__name__)
 
-@app.route('/')
-def home():
-    return "✅ ICT Bot Flask server is running!"
+# توكن بوت تيليجرام
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")  # تأكد إنك ضايفه في Render Environment
+CHAT_ID = os.getenv("CHAT_ID")  # أيضاً ضيف الـ chat id لو تبغاه ثابت
 
-# إعداد التوكن والـ Chat ID
-BOT_TOKEN = "8461165121:AAG3rQ5GFkv-Jmw-6GxHaQ56p-tgXLopp_A"
-CHAT_ID = "690864747"
-SYMBOLS = ["BTC/USD", "ETH/USD", "EUR/USD", "GBP/USD", "USD/JPY", "XAU/USD"]
+# رابط API (مثل Alpha Vantage أو أي مصدر أسعار)
+API_URL = "https://www.alphavantage.co/query"
+API_KEY = os.getenv("ALPHA_VANTAGE_KEY")
 
-# إعداد السجل
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-def get_price(symbol):
+# دالة تجيب البيانات من Alpha Vantage
+def fetch_price(symbol="BTCUSD"):
     try:
-        base, quote = symbol.split("/")
-        url = f"https://api.exchangerate.host/latest?base={base}&symbols={quote}"
-        response = requests.get(url)
+        response = requests.get(API_URL, params={
+            "function": "CURRENCY_EXCHANGE_RATE",
+            "from_currency": "BTC",
+            "to_currency": "USD",
+            "apikey": API_KEY
+        })
         data = response.json()
-        return data["rates"][quote]
+        price = data["Realtime Currency Exchange Rate"]["5. Exchange Rate"]
+        return price
     except Exception as e:
-        logger.error(f"❌ خطأ في جلب السعر لـ {symbol}: {e}")
+        logger.error(f"❌ خطأ أثناء جلب السعر: {e}")
         return None
 
-def ict_analysis(symbol, price):
-    if price is None:
-        return f"⚠️ لم أستطع جلب السعر لـ {symbol}"
-    trend = "صاعد 📈" if int(str(price).replace('.', '')[-1]) % 2 == 0 else "هابط 📉"
-    bos = "تم كسر هيكل السوق" if price % 2 == 0 else "هيكل السوق مستقر"
-    signal = "🟩 شراء" if "صاعد" in trend else "🟥 بيع"
-    return (
-        f"🔹 {symbol}\n"
-        f"💰 السعر الحالي: {price:.4f}\n"
-        f"📊 الاتجاه: {trend}\n"
-        f"📉 {bos}\n"
-        f"🎯 التوصية: {signal}\n"
-        f"⏱ {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
-    )
+# دالة ترسل رسالة إلى تيليجرام
+def send_message(message):
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {"chat_id": CHAT_ID, "text": message}
+        requests.post(url, data=payload)
+        logger.info(f"📨 تم إرسال الرسالة إلى تيليجرام: {message}")
+    except Exception as e:
+        logger.error(f"❌ خطأ أثناء إرسال الرسالة: {e}")
 
-async def send_analysis():
-    logger.info("🚀
+# المهمة الرئيسية
+def analyze_and_send():
+    while True:
+        logger.info("🚀 بدء التحليل والإرسال...")
+        price = fetch_price()
+        if price:
+            msg = f"💰 سعر BTC الحالي: {price}"
+            send_message(msg)
+        else:
+            send_message("⚠️ تعذر جلب السعر حالياً.")
+        logger.info("✅ تم إرسال التحليل، بانتظار الجولة القادمة...")
+        time.sleep(300)  # كل 5 دقائق
+
+# تشغيل المهمة في خيط منفصل
+def start_background_thread():
+    thread = threading.Thread(target=analyze_and_send)
+    thread.daemon = True
+    thread.start()
+    logger.info("🔥 تشغيل خيط البوت...")
+
+# مسار رئيسي لتأكيد عمل السيرفر
+@app.route('/')
+def home():
+    return "✅ البوت يعمل حالياً على Render!"
+
+if __name__ == '__main__':
+    logger.info("🤖 بدء تشغيل بوت تيليجرام...")
+    start_background_thread()
+    app.run(host='0.0.0.0', port=10000)
